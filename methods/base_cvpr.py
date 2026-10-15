@@ -5,8 +5,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from utils.toolkit import tensor2numpy, accuracy
-from scipy.spatial.distance import cdist
-from utils.data_manager import DummyDataset, _get_idata
+from utils.dmc import DummyDataset, _get_idata
 from torchvision import transforms
 
 EPSILON = 1e-8
@@ -132,7 +131,7 @@ class BaseLearner(object):
         ret["grouped"] = grouped
         ret["top1"] = grouped["total"]
         ret["top{}".format(self.topk)] = np.around(
-            (y_pred.T == np.tile(y_true, (self.topk, 1))).sum() * 100 / len(y_true),
+            (y_pred.T == np.tile(y_true, (y_pred.shape[1], 1))).sum() * 100 / len(y_true),
             decimals=2,
         )
 
@@ -170,7 +169,7 @@ class BaseLearner(object):
         out_1_all = []
         targets_all = []
         for i, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.cuda()
+            inputs = inputs.to(next(model.parameters()).device)
             with torch.no_grad():
                 outs = model(inputs, P_H, P_T, bar_eH_G, r_H, r_T)
                 outputs = outs["logits"]
@@ -198,12 +197,12 @@ class BaseLearner(object):
         self._network.eval()
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.cuda()
+            inputs = inputs.to(next(self._network.parameters()).device)
             with torch.no_grad():
                 outputs = self._network(inputs, P_H, P_T, bar_eH_G, r_H, r_T)["logits"]
             
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
+                outputs, k=min(self.topk, outputs.shape[1]), dim=1, largest=True, sorted=True
             )[
                 1
             ]  # [bs, topk]
@@ -217,7 +216,9 @@ class BaseLearner(object):
         vectors, y_true = self._extract_vectors(loader)
         vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
 
-        dists = cdist(class_means, vectors, "sqeuclidean")  # [nb_classes, N]
+        dists = (np.square(class_means).sum(axis=1)[:, None]
+                 + np.square(vectors).sum(axis=1)[None, :]
+                 - 2 * class_means @ vectors.T)  # [nb_classes, N]
         scores = dists.T  # [N, nb_classes], choose the one with the smallest distance
 
         return np.argsort(scores, axis=1)[:, : self.topk], y_true  # [N, topk]
@@ -229,11 +230,11 @@ class BaseLearner(object):
             _targets = _targets.numpy()
             if isinstance(self._network, nn.DataParallel):
                 _vectors = tensor2numpy(
-                    self._network.module.extract_vector(_inputs.cuda())
+                    self._network.module.extract_vector(_inputs.to(next(self._network.parameters()).device))
                 )
             else:
                 _vectors = tensor2numpy(
-                    self._network.extract_vector(_inputs.cuda())
+                    self._network.extract_vector(_inputs.to(next(self._network.parameters()).device))
                 )
 
             vectors.append(_vectors)

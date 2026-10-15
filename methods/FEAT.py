@@ -1,711 +1,261 @@
-import numpy as np
-import torch
-from torch import nn
-from tqdm import tqdm
-from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset, WeightedRandomSampler
-from utils.inc_net import IncrementalNet_CausalETF as IncrementalNet
-from methods.base_cvpr import BaseLearner
-from utils.dmc import partition_data, DatasetSplit, average_weights, average_bias_vector, setup_seed, pil_loader
-import copy, wandb
-import os, math
-import pickle
-from PIL import Image
-import random
-from itertools import chain, combinations
-import shutil
-from torchvision import transforms
-from collections import defaultdict
-from torchvision.transforms import ColorJitter
-from PIL import ImageOps
-from PIL import ImageDraw
-import json
-import ipdb
+"""Federated Geometry-Aware Correction (FEAT), arXiv:2604.08617.
+
+GSA follows equations 3-5 and 15; EGC follows equations 8-14.  The replay
+policy is deliberately independent of FEAT, as in the paper.  This runner
+uses the FedCBDR global-perspective replay selector.
+"""
+
 import copy
 import logging
+import sys
+
+import numpy as np
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from methods.base_cvpr import BaseLearner
+from utils.dmc import DummyDataset, average_weights, partition_data, setup_seed
+from utils.fedcbdr_replay import select_fedcbdr_indices
+from utils.inc_net import IncrementalNet_CausalETF
 
 
-class IndexedDataset(Dataset):
-    def __init__(self, dataset, indices, transform):
-
-        self.images = dataset.images[indices]
-        self.labels = dataset.labels[indices]
-        self.transform = transform
-
-    def __getitem__(self, idx):
-
-        image = self.transform(Image.fromarray(self.images[idx]))  # 通过索引映射到原始数据集的索引
-        label = self.labels[idx]
-        return idx, image, label
-
-    def __len__(self):
-
-        return len(self.indices)
+def gsa_distill_loss(features, labels, prototypes, tau=0.5):
+    """Class-balanced KL(P_feature || P_prototype) over batch relation rows."""
+    if tau <= 0:
+        raise ValueError("GSA temperature must be positive")
+    f = F.normalize(features, dim=1)
+    p = F.normalize(prototypes[labels], dim=1).detach()
+    log_feature = F.log_softmax((f @ f.T) / tau, dim=1)
+    log_target = F.log_softmax((p @ p.T) / tau, dim=1)
+    row_kl = (log_feature.exp() * (log_feature - log_target)).sum(dim=1)
+    _, inverse, counts = torch.unique(labels, return_inverse=True, return_counts=True)
+    per_class = torch.zeros(len(counts), device=features.device, dtype=features.dtype)
+    per_class.scatter_add_(0, inverse, row_kl)
+    return (per_class / counts).mean()
 
 
-def insert_cifar_on_background(foreground, background, tttt=200, scale=[0.8, 0.9]):
-
-    background = apply_color_jitter(foreground)  # 风格一致
-    
-    bg_w, bg_h = background.size
-    fg_w, fg_h = foreground.size
-
-    new_w, new_h = int(fg_w * scale[0]), int(fg_h * scale[1])
-    foreground = foreground.resize((new_w, new_h), Image.ANTIALIAS)
-
-    background = background.convert("RGBA")
-    foreground = foreground.convert("RGBA")
-
-    alpha_mask = Image.new("L", (new_w, new_h), tttt)
-    foreground.putalpha(alpha_mask)
-
-    max_x = bg_w - new_w
-    max_y = bg_h - new_h
-    x = random.randint(0, max_x)
-    y = random.randint(0, max_y)
-
-    composed = background.copy()
-    composed.paste(foreground, (x, y), foreground)  
-
-    return composed.convert("RGB")  
+def _build_projector_from_W(prototypes):
+    """Equation 8: orthogonal projector onto the prototype column space."""
+    projector = prototypes @ torch.linalg.pinv(prototypes.T @ prototypes) @ prototypes.T
+    return (projector + projector.T) / 2
 
 
-def apply_color_jitter(image):
-
-    jitter = ColorJitter(brightness=0.6, contrast=0.6, saturation=0.6, hue=0.4)
-    return jitter(image)
-
-class CustomConcatDataset(ConcatDataset):
-
-    def __init__(self, datasets, transform, args, logger):
-        if args['dataset'] == 'tiny_imagenet':
-            self.use_path = True
-        else:
-            self.use_path = False
-        datasets = [*datasets[0], *[item for _ in range(args['n']) for item in datasets[1]]]
-
-        self.labels = np.concatenate([ds.labels for ds in datasets])
-        self.images = np.concatenate([ds.images for ds in datasets])
-
-        self.local_len = len(datasets[0].labels)
-        self.transform = transform
-        self.scale_list = [0.8, 0.85, 0.9, 0.95]
-        self.args = args
-
-        LD = label_distribution(self.labels)
-        logger.info("Label Distribution: %s" % str(LD))
-        print(LD)
-
-    def __getitem__(self, idx):
-
-        if self.use_path:
-            image = pil_loader(self.images[idx])
-        else:
-            image = Image.fromarray(self.images[idx])
-
-        label = self.labels[idx]
-        if idx >= self.local_len:
-            is_com = random.choice(['NO', 'YES'])
-            if is_com == 'YES':
-                background_ids = random.sample(range(len(self.labels)), k=5)
-                scale_0 = random.choice(self.scale_list)
-                scale_1 = random.choice(self.scale_list)
-                image = insert_cifar_on_background(image, None, tttt=self.args['tttt'], scale=[scale_0, scale_1])
-
-        img = self.transform(image)
-        return idx, img, label
-
-    def __len__(self):
-        return len(self.labels)
+@torch.no_grad()
+def estimate_ecc_priors(model, loader, num_tail, rho):
+    """Estimate local tail-sample EMA energies (equation 9)."""
+    weights = F.normalize(model.fc.weight.detach(), dim=1).T
+    P_T = _build_projector_from_W(weights[:, :num_tail])
+    P_H = _build_projector_from_W(weights[:, num_tail:])
+    r_T = max(num_tail - 1, 1)
+    r_H = max(weights.shape[1] - num_tail - 1, 1)
+    head_ema = tail_ema = None
+    n_tail = 0
+    model.eval()
+    for _, images, labels in loader:
+        tail_mask = labels < num_tail
+        if not tail_mask.any():
+            continue
+        features = F.normalize(model.extract_vector(images.to(weights.device))[
+            tail_mask.to(weights.device)
+        ], dim=1)
+        head_energy = (features @ P_H).square().sum(dim=1).mean() / r_H
+        tail_energy = (features @ P_T).square().sum(dim=1).mean() / r_T
+        head_ema = rho * head_energy if head_ema is None else (1 - rho) * head_ema + rho * head_energy
+        tail_ema = rho * tail_energy if tail_ema is None else (1 - rho) * tail_ema + rho * tail_energy
+        n_tail += int(tail_mask.sum())
+    return {
+        "bar_eH_T": None if head_ema is None else float(head_ema),
+        "bar_eT_T": None if tail_ema is None else float(tail_ema),
+        "nT": n_tail,
+    }
 
 
-def normalize(tensor, mean, std, reverse=False):
-    if reverse:
-        _mean = [-m / s for m, s in zip(mean, std)]
-        _std = [1 / s for s in std]
-    else:
-        _mean = mean
-        _std = std
-
-    _mean = torch.as_tensor(_mean, dtype=tensor.dtype, device=tensor.device)
-    _std = torch.as_tensor(_std, dtype=tensor.dtype, device=tensor.device)
-    tensor = (tensor - _mean[None, :, None, None]) / (_std[None, :, None, None])
-    return tensor
-
-
-class Normalizer(object):
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, x, reverse=False):
-        return normalize(x, self.mean, self.std, reverse=reverse)
-
-
-def label_distribution(labels: np.ndarray) -> dict:
-    unique, counts = np.unique(labels, return_counts=True)
-    return dict(zip(unique, counts))
-
-
-class FLDataSelector:
-    def __init__(self, num_clients, local_features, query_budget):
-
-        self.num_clients = num_clients
-        self.local_features = local_features
-        self.query_budget = query_budget
-        self.P = [self.generate_random_orthogonal_matrix(F.shape[0]) for F in local_features]  # 生成每个客户端的 P_i
-        self.Q = self.generate_random_orthogonal_matrix(local_features[0].shape[1])  # 生成全局的 Q
-
-    def generate_random_orthogonal_matrix(self, size):
-
-        random_matrix = torch.randn(size, size)
-        Q, _ = torch.linalg.qr(random_matrix)  # QR 分解生成正交矩阵
-        return Q
-
-    def mask_local_data(self):
-
-        masked_features = []
-        for i, F in enumerate(self.local_features):
-            masked_F = torch.matmul(torch.matmul(self.P[i], F), self.Q)  # X'_i = P_i X_i Q
-            masked_features.append(masked_F)
-        return masked_features
-
-    def compute_local_leverage_scores(self, masked_features):
-
-        leverage_scores = []
-        for F in masked_features:
-            U, _, _ = torch.svd(F)
-            tau_i = torch.norm(U, dim=1) ** 2
-            tau_i /= tau_i.sum()
-            leverage_scores.append(tau_i)
-        return leverage_scores
-
-    def aggregate_leverage_scores(self, leverage_scores):
-
-        client_weights = torch.tensor([1.0 / self.num_clients] * self.num_clients)  # 每个客户端的权重均衡
-
-        all_scores = [tau * client_weights[i] for i, tau in enumerate(leverage_scores)]
-
-        all_scores = torch.cat(all_scores)
-        p = all_scores / all_scores.sum()
-        return p
-
-    def sample_data(self, p):
-
-        min_samples_per_client = self.query_budget // self.num_clients
-        client_selected_indices = {i: [] for i in range(self.num_clients)}
-
-        start_idx = 0
-        for i in range(self.num_clients):
-            end_idx = start_idx + len(self.local_features[i])
-            client_p = p[start_idx:end_idx]
-            sampled = torch.multinomial(client_p, min_samples_per_client, replacement=True)
-            client_selected_indices[i] = sampled.cpu().numpy()
-            start_idx = end_idx
-
-        remaining_budget = self.query_budget - sum(len(v) for v in client_selected_indices.values())
-        if remaining_budget > 0:
-            extra_samples = torch.multinomial(p, remaining_budget, replacement=True).tolist()
-            for idx in extra_samples:
-                for i in range(self.num_clients):
-                    start_idx = sum(len(self.local_features[j]) for j in range(i))
-                    end_idx = start_idx + len(self.local_features[i])
-                    if start_idx <= idx < end_idx:
-                        client_selected_indices[i].append(idx)
-                        break
-
-        return client_selected_indices
+def aggregate_ecc_priors_from_clients(priors):
+    """Sample-size-weighted global priors (equation 10)."""
+    count = sum(p["nT"] for p in priors)
+    if count == 0:
+        return None
+    return {
+        "bar_eH_G": sum(p["bar_eH_T"] * p["nT"] for p in priors) / count,
+        "bar_eT_G": sum(p["bar_eT_T"] * p["nT"] for p in priors) / count,
+        "nT_sum": count,
+    }
 
 
 class FEAT(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
-        self._network = IncrementalNet(args, False)
-        self.class_order = torch.tensor(args["class_order"], device=args["gpu"])
-        self.args = args
-        self.r = args['r']
-        self.ltc = args['ltc']
-        self.transform, self.normalizer = self._get_norm_and_transform(self.args["dataset"])
-        self.selected_data_indices = []
-        self.retained_ds_all = [[] for _ in range(args['num_users'])]
+        self._network = IncrementalNet_CausalETF(args)
+        self.device = torch.device(f"cuda:{args['gpu']}" if torch.cuda.is_available() else "cpu")
+        self._network.to(self.device)
+        self.retained_ds_all = [[] for _ in range(args["num_users"])]
+        self.PH = self.PT = self.bar_eH_G = self.bar_eT_G = self.r_H = self.r_T = None
+        self.logger = logging.getLogger(__name__)
 
-        self.PH, self.PT, self.bar_eH_G, self.r_H, self.r_T = None, None, None, None, None
+    def _loader(self, dataset, *, shuffle=False, batch_size=None):
+        workers = self.args["num_worker"]
+        options = dict(batch_size=batch_size or self.args["local_bs"], shuffle=shuffle,
+                       num_workers=workers, pin_memory=self.device.type == "cuda")
+        if workers:
+            options["persistent_workers"] = True
+            if self.args.get("mulc") and not sys.platform.startswith("win"):
+                options["multiprocessing_context"] = self.args["mulc"]
+        return DataLoader(dataset, **options)
 
-    def _get_norm_and_transform(self, dataset):
+    def _replay_dataset(self, client, train_dataset):
+        indices = np.asarray(self.user_groups[client], dtype=int)
+        images, labels = train_dataset.images[indices], train_dataset.labels[indices]
+        for old_images, old_labels in self.retained_ds_all[client]:
+            images = np.concatenate((images, old_images))
+            labels = np.concatenate((labels, old_labels))
+        return DummyDataset(images, labels, train_dataset.trsf, train_dataset.use_path)
 
-        if dataset == "cifar100":
-            data_normalize = dict(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761))
-            train_transform = transforms.Compose([
-                # transforms.Resize((32, 32)),
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(brightness=63 / 255),
-                transforms.ToTensor(),
-                transforms.Normalize(**dict(data_normalize)),
-            ])
-        elif dataset == "cifar10":
-            data_normalize = dict(mean=(0.4914, 0.4822, 0.4465), std=(0.2023, 0.1994, 0.2010))
-            train_transform = transforms.Compose([
-                # transforms.Resize((32, 32)),
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=63 / 255),
-                transforms.ToTensor(),
-                transforms.Normalize(**dict(data_normalize)),
-            ])
-
-        elif dataset == "tiny_imagenet":
-            data_normalize = dict(mean=[0.4802, 0.4481, 0.3975], std=[0.2302, 0.2265, 0.2262])
-            train_transform = transforms.Compose([
-                # transforms.Resize((64, 64)),
-                transforms.RandomCrop(64, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(**dict(data_normalize)),
-            ])
-        return train_transform, Normalizer(**dict(data_normalize))
-
-    def _get_client_dataset(self, client_idx):
-
-        self.train_dataset, _ = self.data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
-            source="train",
-            mode="train",
-        )
-
-        client_indices = self.user_groups[client_idx]
-
-        client_dataset = DatasetSplit(self.train_dataset, client_indices)
-        return client_dataset
-
-    def after_task(self):
-
-        self._known_classes = self._total_classes
-        self._old_network = self._network.copy().freeze()
-        test_acc = self._compute_accuracy(self._old_network, self.test_loader, self.PH, self.PT, self.bar_eH_G, self.r_H, self.r_T)
-        self.logger.info("After Task: %d,  Test ACC: %s" % (self._cur_task, str(test_acc)))
-
-        print("After Test Acc: %s" % test_acc)
-
-    def _select_data_for_retention(self):
-
-        all_client_features = []
-        all_client_indices = []
-        for client_idx in range(self.args["num_users"]):
-            try:
-                client_features, client_indices = self._extract_client_features(client_idx)
-                if len(client_features) > 0:
-                    all_client_features.append(client_features)
-                    all_client_indices.append(client_indices)
-            except ValueError as e:
-                print(f"Error extracting features for client {client_idx}: {e}")
-                continue
-
-        if len(all_client_features) == 0:
-            print("No features extracted from any client. Skipping data selection.")
+    @torch.no_grad()
+    def _retain_exemplars(self, train_dataset):
+        """FedCBDR global pseudo-feature and leverage-score replay selection."""
+        budget = self.args["mem_size"]
+        if budget <= 0:
             return
-
-        selector = FLDataSelector(self.args["num_users"], all_client_features,
-                                  (self._total_classes - self._known_classes) * self.args["mem_size"])
-        masked_features = selector.mask_local_data()
-
-        leverage_scores = selector.compute_local_leverage_scores(masked_features)
-
-        p = selector.aggregate_leverage_scores(leverage_scores)
-
-        selected_indices = selector.sample_data(p)
-
-        self.selected_data_indices = selected_indices
-
-    def _extract_client_features(self, client_idx):
-
-        if not hasattr(self, "_known_classes") or not hasattr(self, "_total_classes"):
-            raise ValueError("_known_classes or _total_classes is not defined.")
-
-        client_dataset = self._get_client_dataset(client_idx)
-        local_train_loader = DataLoader(
-            client_dataset,
-            batch_size=self.args["local_bs"],
-            shuffle=False,
-            num_workers=self.args["num_worker"],
-            pin_memory=True,
-            multiprocessing_context=self.args["mulc"],
-            persistent_workers=True,
-            drop_last=False
+        # Use the deterministic test transform so feature rows correspond to
+        # stable local sample IDs, even when training uses random augmentation.
+        selection_dataset, _ = self.data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="train", mode="test"
         )
-        features = []
-        indices = []
+        if not np.array_equal(selection_dataset.labels, train_dataset.labels):
+            raise RuntimeError("Selection and training datasets have different sample order")
         self._network.eval()
-        with torch.no_grad():
-            for batch_idx, (_, images, labels) in enumerate(local_train_loader):
-                images = images.cuda()
-                output_list = self._network(images)
-                feature = output_list["att"]
-                features.append(feature.cpu())
-                start_idx = batch_idx * self.args["local_bs"]
-                end_idx = start_idx + images.size(0)
-                indices.extend(range(start_idx, end_idx))
+        local_features = []
+        local_labels = []
+        for client in range(self.args["num_users"]):
+            client_indices = np.asarray(self.user_groups[client], dtype=int)
+            client_dataset = DummyDataset(
+                selection_dataset.images[client_indices],
+                selection_dataset.labels[client_indices],
+                selection_dataset.trsf, selection_dataset.use_path
+            )
+            features = []
+            for _, images, _ in self._loader(client_dataset):
+                features.append(self._network.extract_vector(images.to(self.device)).cpu())
+            local_features.append(
+                torch.cat(features) if features else torch.empty(0, self._network.feature_dim)
+            )
+            local_labels.append(train_dataset.labels[client_indices])
 
-        features = torch.cat(features, dim=0)
-        return features, indices
-
-    def _get_retained_dataset(self, client_idx):
-
-        client_dataset = self._get_client_dataset(client_idx)
-        retained_dataset = IndexedDataset(client_dataset, self.selected_data_indices[client_idx], self.transform)
-
-        return retained_dataset
+        selected = select_fedcbdr_indices(
+            local_features, local_labels, per_class_budget=budget,
+            seed=self.seed + self._cur_task
+        )
+        for client, positions in selected.items():
+            client_indices = np.asarray(self.user_groups[client], dtype=int)
+            chosen = client_indices[np.asarray(positions, dtype=int)]
+            if len(chosen):
+                self.retained_ds_all[client].append(
+                    (train_dataset.images[chosen].copy(), train_dataset.labels[chosen].copy())
+                )
 
     def incremental_train(self, data_manager, logger):
         self.logger = logger
-
-        setup_seed(self.seed)
         self.data_manager = data_manager
+        setup_seed(self.seed + self._cur_task + 1)
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
-        # self._network.update_fc(self._total_classes, num_head=self.args["num_head"], tau=self.args["tau"], alpha=self.args["alpha"], gamma=self.args["gamma"])
         self._network.update_fc(self._total_classes)
-        self._network.cuda()
-        print("Learning on {}-{}".format(self._known_classes, self._total_classes))
+        self._network.to(self.device)
+        self.PH = self.PT = self.bar_eH_G = self.bar_eT_G = self.r_H = self.r_T = None
 
-        # 获取当前任务的数据
-        train_dataset, train_data_indices = self.data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
-            source="train",
-            mode="train",
+        train_dataset, _ = data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes), source="train", mode="train"
         )
-
-        test_dataset, _ = self.data_manager.get_dataset(
-            np.arange(0, self._total_classes), source="test", mode="test"
+        test_dataset, _ = data_manager.get_dataset(
+            np.arange(self._total_classes), source="test", mode="test"
         )
-        self.test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=self.args["num_worker"],
-                                      multiprocessing_context=self.args["mulc"], persistent_workers=True)
+        self.test_loader = self._loader(test_dataset, batch_size=256)
+        self.user_groups, _ = partition_data(
+            train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"]
+        )
+        self._fl_train(train_dataset)
+        if self._cur_task < data_manager.nb_tasks - 1:
+            self._retain_exemplars(train_dataset)
 
-        if self._cur_task > 0:
-            old_test_dataset, _ = self.data_manager.get_dataset(
-                np.arange(0, self._known_classes), source="test", mode="test"
-            )
-            self.old_loader = DataLoader(
-                old_test_dataset, batch_size=256, shuffle=False, num_workers=self.args["num_worker"],
-                multiprocessing_context=self.args["mulc"], persistent_workers=True
-            )
-            new_dataset, _ = self.data_manager.get_dataset(
-                np.arange(self._known_classes, self._total_classes), source="test", mode="test"
-            )
-            self.new_loader = DataLoader(
-                new_dataset, batch_size=256, shuffle=False, num_workers=self.args["num_worker"],
-                multiprocessing_context=self.args["mulc"], persistent_workers=True
-            )
-
-        self._fl_train(train_dataset, train_data_indices, self.test_loader)
-
-    def _fl_train(self, train_dataset, train_data_indices, test_loader):
-
-        self._network.cuda()
-        #         ipdb.set_trace()
-        self.best_model = None
-        self.lowest_loss = np.inf
-
-        prog_bar = tqdm(range(self.args["com_round"]))
-        optimizer = torch.optim.SGD(self._network.parameters(), lr=self.args['local_lr'], momentum=0.9,
-                                    weight_decay=self.args['weight_decay'])
-        if self.args["dataset"] == "tiny_imagenet" or self.args["dataset"] == "imagenet":
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.1)
-        else:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args["com_round"], eta_min=1e-3)
-
-        user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
-        self.user_groups = user_groups
-
-        for _, com in enumerate(prog_bar):
+    def _fl_train(self, train_dataset):
+        rounds = self.args["com_round"]
+        for round_id in tqdm(range(rounds), desc=f"Task {self._cur_task + 1}"):
             local_weights = []
-            # m = max(int(self.args["frac"] * self.args["num_users"]), 1)
-            # idxs_users = np.random.choice(range(self.args["num_users"]), m, replace=False)
-            idxs_users = range(self.args["num_users"])
-            loss_weight = []
-            priors_list = []
-            for idx in idxs_users:
-                local_train_ds_i = DatasetSplit(train_dataset, self.user_groups[idx])
+            local_priors = []
+            lr = self.args["local_lr"]
+            for client in range(self.args["num_users"]):
+                client_data = self._replay_dataset(client, train_dataset)
+                if not len(client_data):
+                    continue
+                local_model = copy.deepcopy(self._network)
+                loader = self._loader(client_data, shuffle=True)
+                self._local_update(local_model, loader, lr)
+                local_weights.append({key: value.detach().cpu().clone()
+                                      for key, value in local_model.state_dict().items()})
                 if self._cur_task > 0:
+                    old_data = self.retained_ds_all[client]
+                    if old_data:
+                        images = np.concatenate([part[0] for part in old_data])
+                        labels = np.concatenate([part[1] for part in old_data])
+                        replay = DummyDataset(images, labels, train_dataset.trsf, train_dataset.use_path)
+                        local_priors.append(estimate_ecc_priors(
+                            local_model, self._loader(replay), self._known_classes,
+                            self.args["ema_decay"]
+                        ))
+                del local_model
 
-                    client_bboxes = None
-                    local_train_ds_i = CustomConcatDataset([[local_train_ds_i], self.retained_ds_all[idx]], self.transform, self.args, self.logger)
-                    print('####', local_train_ds_i.labels.shape)
-                local_train_loader = DataLoader(local_train_ds_i, batch_size=self.args["local_bs"], shuffle=True,
-                                                num_workers=self.args["num_worker"], pin_memory=True,
-                                                multiprocessing_context=self.args["mulc"], persistent_workers=True)
+            if not local_weights:
+                raise RuntimeError("No client received training data")
+            fixed_etf = self._network.fc.weight.detach().clone()
+            self._network.load_state_dict(average_weights(local_weights))
+            with torch.no_grad():
+                self._network.fc.weight.copy_(fixed_etf)
+            if self._cur_task > 0:
+                global_priors = aggregate_ecc_priors_from_clients(local_priors)
+                self.bar_eH_G = None if global_priors is None else global_priors["bar_eH_G"]
+                self.bar_eT_G = None if global_priors is None else global_priors["bar_eT_G"]
+                self._update_projectors()
+            if self.args.get("eval_each_round", False):
+                accuracy = self._compute_accuracy(
+                    self._network, self.test_loader, self.PH, self.PT,
+                    self.bar_eH_G, self.r_H, self.r_T
+                )
+                self.logger.info("Task %d round %d: %.2f%%", self._cur_task + 1, round_id + 1, accuracy)
 
-                if self._cur_task == 0:
-                    w, total_loss = self._local_update(copy.deepcopy(self._network), local_train_loader,
-                                                       scheduler.get_last_lr()[0])
-                else:
-                    w, total_loss, priors, P_H, P_T = self._local_finetune(self._old_network, copy.deepcopy(self._network),
-                                                                     local_train_loader, self._cur_task, idx, scheduler.get_last_lr()[0])
-                    priors_list.append(priors)
+    def _update_projectors(self):
+        weights = F.normalize(self._network.fc.weight.detach(), dim=1).T
+        self.PT = _build_projector_from_W(weights[:, :self._known_classes])
+        self.PH = _build_projector_from_W(weights[:, self._known_classes:])
+        self.r_T = max(self._known_classes - 1, 1)
+        self.r_H = max(self._total_classes - self._known_classes - 1, 1)
 
-                local_weights.append(copy.deepcopy(w))
-                loss_weight.append(total_loss)
-
-                del local_train_loader, w
-                torch.cuda.empty_cache()
-            scheduler.step()
-            sum_loss = sum(loss_weight)
-            if sum_loss < self.lowest_loss:
-                self.lowest_loss = sum_loss
-                self.best_model = copy.deepcopy(self._network.state_dict())
-
-            global_weights = average_weights(local_weights)
-            self._network.load_state_dict(global_weights)
-
-            if com % 1 == 0 and com < self.args["com_round"]:
-                test_acc = self._compute_accuracy(self._network, test_loader)
-                if self._cur_task > 0:
-                    test_old_acc = self._compute_accuracy(copy.deepcopy(self._network), self.old_loader)
-                    test_new_acc = self._compute_accuracy(copy.deepcopy(self._network), self.new_loader)
-                    print("Task {}, Test_accy {:.2f} O {} N {}".format(self._cur_task, test_acc, test_old_acc,
-                                                                       test_new_acc))
-                info = (
-                    "Task {}, Epoch {}/{} =>  Test_accy {:.2f}".format(self._cur_task, com + 1, self.args["com_round"],
-                                                                       test_acc))
-                self.logger.info(info)
-                prog_bar.set_description(info)
-                
-        if self._cur_task > 0:
-            global_priors = aggregate_ecc_priors_from_clients(priors_list, eps=1e-8)
-            self.bar_eH_G = global_priors["bar_eH_G"]
-            self.PH = P_H
-            self.PT = P_T
-            self.r_H = self._total_classes - self._known_classes - 1
-            self.r_T = self._known_classes - 1
-            
-        self._network.load_state_dict(self.best_model)
-        if self._cur_task < self.tasks - 1:
-            self._select_data_for_retention()
-            for idx in idxs_users:
-                #
-                local_retained_ds = self._get_retained_dataset(idx)
-                self.retained_ds_all[idx].append(local_retained_ds)
-            # #
-                client_retained_indices = self.selected_data_indices[idx]
-                client_indices_all = train_data_indices[self.user_groups[idx]]
-
-        del self.best_model
-        torch.cuda.empty_cache()
-
-    def _local_update(self, model, train_data_loader, lr):
-
+    def _local_update(self, model, loader, lr):
         model.train()
-        total_loss = 0
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=self.args['weight_decay'])
-        prototypes = model.fc.weight
-        # ipdb.set_trace()
-        for iter in range(self.args["local_ep"]):
-            epoch_lossce_collector = []
-            epoch_lossrd_collector = []
-            for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
-                output_list = model(images)
-                output = output_list["logits"]
-                loss_ce = F.cross_entropy(output, labels)
-                feats = output_list["features"]
-                loss_rd = gsa_distill_loss(feats, labels, prototypes)
-                loss = loss_ce + self.args["kd"] * loss_rd
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
+                                    weight_decay=self.args["weight_decay"])
+        for epoch in range(self.args["local_ep"]):
+            total = 0.0
+            batches = 0
+            for _, images, labels in loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                output = model(images)
+                loss = F.cross_entropy(output["logits"], labels)
+                if self._cur_task > 0:
+                    loss = loss + self.args["lambda"] * gsa_distill_loss(
+                        output["features"], labels, model.fc.weight,
+                        tau=self.args["temp"]
+                    )
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                if iter == 0:
-                    total_loss += loss.detach()
-                epoch_lossce_collector.append(loss_ce.item())
-                epoch_lossrd_collector.append(loss_rd.item())
-            epoch_lossce = sum(epoch_lossce_collector) / len(epoch_lossce_collector)
-            epoch_lossrd = sum(epoch_lossrd_collector) / len(epoch_lossrd_collector)
-            self.logger.info('Epoch: %d Loss CE: %f  Loss RD: %f ' % (iter, epoch_lossce, epoch_lossrd))
-        return model.state_dict(), total_loss
+                total += float(loss.detach())
+                batches += 1
+            self.logger.info("Task %d local epoch %d loss %.4f", self._cur_task + 1,
+                             epoch + 1, total / max(batches, 1))
 
-    def _local_finetune(self, teacher, model, train_data_loader, task_id, client_id, lr):
-
-        model.train()
-        teacher.eval()
-        total_loss = 0
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=self.args['weight_decay'])
-        prototypes = model.fc.weight
-        tail_class_ids = list(range(self._known_classes))
-        for it in range(self.args["local_ep"]):
-            epoch_lossce_collector = []
-            epoch_lossrd_collector = []
-            for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
-                # print('labels:', labels)
-                output_list = model(images)
-                output = output_list["logits"]
-                loss_ce = F.cross_entropy(output, labels)
-                feats = output_list["features"]
-                loss_rd = gsa_distill_loss(feats, labels, prototypes)
-                loss = loss_ce + self.args["kd"] * loss_rd
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                if it == 0:
-                    total_loss += loss.detach()
-                epoch_lossce_collector.append(loss_ce.item())
-                epoch_lossrd_collector.append(loss_rd.item())
-            epoch_lossce = sum(epoch_lossce_collector) / len(epoch_lossce_collector)
-            epoch_lossrd = sum(epoch_lossrd_collector) / len(epoch_lossrd_collector)
-            self.logger.info('Epoch: %d Loss CE: %f  Loss RD: %f ' % (it, epoch_lossce, epoch_lossrd))
-        print('prototypes.shape', prototypes.shape)
-        print('self._known_classes', self._known_classes)
-        tail_class_ids = list(range(self._known_classes))
-        head_class_ids = list(range(self._known_classes, self._total_classes))
-        priors, P_H, P_T = estimate_ecc_priors(model=model, data_loader=train_data_loader, head_class_ids=head_class_ids, tail_class_ids=tail_class_ids, \
-                                                        ema_decay=float(self.args["ema_decay"]), feature_key="features")
-        return model.state_dict(), total_loss, priors, P_H, P_T
-
-
-def gsa_distill_loss(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    prototypes: torch.Tensor,
-    tau: float = 0.07,
-    eps: float = 1e-8,
-    include_self: bool = True,
-) -> torch.Tensor:
-
-    device = features.device
-    B, d = features.shape
-
-    f = F.normalize(features, dim=1)        # [B, d]
-    W = F.normalize(prototypes, dim=0)      # [d, C_t]
-
-    MF = torch.matmul(f, f.t())             # [B, B]
-
-    Py = W[:, labels].t().contiguous()      # [B, d]
-    Py = F.normalize(Py, dim=1)
-    MP = torch.matmul(Py, Py.t())           # [B, B]
-
-    if not include_self:
-        diag_mask = torch.eye(B, dtype=torch.bool, device=device)
-        MF = MF.masked_fill(diag_mask, -float('inf'))
-        MP = MP.masked_fill(diag_mask, -float('inf'))
-
-    logPF = F.log_softmax(MF / max(tau, eps), dim=1)        # [B, B]
-    PF    = logPF.exp()
-    logPP = F.log_softmax(MP / max(tau, eps), dim=1).detach()
-
-    row_kl = (PF * (logPF - logPP)).sum(dim=1)              # [B]
-
-
-    uniq, inv = torch.unique(labels, return_inverse=True)  # uniq: [C_B], inv: [B] in [0..C_B-1]
-    Cb = uniq.numel()
-    sum_per_cls = torch.zeros(Cb, device=device).scatter_add_(0, inv, row_kl)
-    cnt_per_cls = torch.zeros(Cb, device=device).scatter_add_(0, inv, torch.ones_like(row_kl))
-    loss = (sum_per_cls / (cnt_per_cls + eps)).mean()
-
-    return loss
-
-
-
-
-def _build_projector_from_W(W_part: torch.Tensor) -> torch.Tensor:
-    """
-    W_part: [d, C_part], column is a (normalized) prototype
-    return: P = W (W^T W)^{+} W^T  \in R^{dxd}
-    """
-
-    G = W_part.t() @ W_part                  # [C_part, C_part]
-    P = W_part @ torch.linalg.pinv(G) @ W_part.t()   # [d, d]
-
-    return 0.5 * (P + P.t())
-
-
-@torch.no_grad()
-def estimate_ecc_priors(
-    model,
-    data_loader,
-    head_class_ids,
-    tail_class_ids,
-    ema_decay: float = 0.9,
-    feature_key: str = "features",
-):
-
-    device = next(model.parameters()).device
-
-    W = F.normalize(model.fc.weight.detach(), dim=1).t()  # [d, C_t]
-    W_H = W[:, head_class_ids] if len(head_class_ids) > 0 else None
-    W_T = W[:, tail_class_ids] if len(tail_class_ids) > 0 else None
-    if W_H is None or W_T is None:
-        return {"bar_eH_T": 0.0, "bar_eT_T": 0.0, "nT": 0}, None, None
-
-    P_H = _build_projector_from_W(W_H)   # [d, d]
-    P_T = _build_projector_from_W(W_T)   # [d, d]
-
-    r_H = max(len(head_class_ids) - 1, 1)   # simplex rank
-    r_T = max(len(tail_class_ids) - 1, 1)
-
-    bar_eH = torch.tensor(0.0, device=device)
-    bar_eT = torch.tensor(0.0, device=device)
-    nT = 0
-    tail_set = set(int(x) for x in tail_class_ids)
-
-    model.eval()
-    for _, images, labels in data_loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        mask = torch.tensor([int(y.item()) in tail_set for y in labels],
-                            device=device, dtype=torch.bool)
-        if mask.sum() == 0:
-            continue
-
-        out = model(images)
-        feat = out.get(feature_key, None)
-        if feat is None:
-            raise RuntimeError(f"model(images) '{feature_key}'。")
-        f = F.normalize(feat[mask], dim=1)  # [B_t, d]
-
-        # rank-normalized energies
-        eH = (f @ (P_H @ f.t())).diagonal() / r_H
-        eT = (f @ (P_T @ f.t())).diagonal() / r_T
-
-        mH = eH.mean()
-        mT = eT.mean()
-        bar_eH = (1 - ema_decay) * bar_eH + ema_decay * mH
-        bar_eT = (1 - ema_decay) * bar_eT + ema_decay * mT
-        nT += int(mask.sum().item())
-
-    return {
-        "bar_eH_T": float(bar_eH.item()),
-        "bar_eT_T": float(bar_eT.item()),
-        "nT": nT,
-    }, P_H, P_T
-
-
-def aggregate_ecc_priors_from_clients(priors_list, eps=1e-12):
-
-    num = 0
-    sum_eH = 0.0
-    sum_eT = 0.0
-    for p in priors_list:
-        nT = int(p.get("nT", 0))
-        if nT <= 0:
-            continue
-        sum_eH += float(p["bar_eH_T"]) * nT
-        sum_eT += float(p["bar_eT_T"]) * nT
-        num    += nT
-
-    if num == 0:
-        return None
-
-    bar_eH_G = sum_eH / (num + eps)
-    bar_eT_G = sum_eT / (num + eps)
-    return {"bar_eH_G": bar_eH_G, "bar_eT_G": bar_eT_G, "nT_sum": num}
-
-
-
-
-
-
-
-
-
-
-
+    def after_task(self):
+        self._known_classes = self._total_classes

@@ -3,14 +3,12 @@ import os
 from utils.dmc import DataManager, setup_seed
 from utils.toolkit import count_parameters
 
-from methods.GSA import GSA
-from methods.EGC import EGC
 from methods.FEAT import FEAT
+from methods.FEAT_repo import FEAT as RepoFEAT
 
 import warnings
 import datetime
 import logging
-import ipdb
 
 warnings.filterwarnings('ignore')
 
@@ -19,7 +17,7 @@ def get_learner(model_name, args):
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        filename=args['method'] + '_training_' + args['dataset'] + '_tasks_' + str(args['tasks']) + '_beta_' + str(
+        filename=args['method'] + '_' + args.get('implementation', 'paper') + '_training_' + args['dataset'] + '_tasks_' + str(args['tasks']) + '_beta_' + str(
             args['beta']) + '_users_' + str(args['num_users']) + '_frac_' + str(args['frac']) + '_mem_size_' + str(args['mem_size']) + '_k_value_' + str(args['k_value']) + '_p_value_' + str(args['p_value']) + '_seed_' + str(args['seed']) + '_local_epoch_' + str(
             args['local_ep']) + '_experiment_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")) + '.log',
         filemode='a'
@@ -27,14 +25,15 @@ def get_learner(model_name, args):
     logger = logging.getLogger(__name__)
 
     name = model_name.lower()
-    if name == "gsa":
-        return GSA(args), logger
-    elif name == "egc":
-        return EGC(args), logger
-    elif name == "feat":
-        return FEAT(args), logger
+    if name == "feat":
+        implementation = args.get("implementation", "paper")
+        if implementation == "paper":
+            return FEAT(args), logger
+        if implementation == "repo":
+            return RepoFEAT(args), logger
+        raise ValueError(f"Unknown implementation: {implementation}")
     else:
-        assert 0
+        raise ValueError(f"Unknown method: {model_name}. Available: feat")
 
 
 def train(args):
@@ -85,9 +84,11 @@ def args_parser():
     # federated continual learning settings
     parser.add_argument('--dataset', type=str, default="cifar100", help='which dataset')
     parser.add_argument('--tasks', type=int, default=5, help='num of tasks')
-    parser.add_argument('--method', type=str, default="lander", help='choose a learner')
+    parser.add_argument('--method', type=str, default="feat", help='choose a learner')
+    parser.add_argument('--implementation', choices=('repo', 'paper'), default='paper',
+                        help='FEAT training path: original repository or paper-based implementation')
     parser.add_argument('--net', type=str, default="resnet18", help='choose a model')
-    parser.add_argument('--com_round', type=int, default=2, help='communication rounds')
+    parser.add_argument('--com_round', type=int, default=100, help='communication rounds')
     parser.add_argument('--num_class', type=int, default=10, help='all class number')
     parser.add_argument('--local_ep', type=int, default=2, help='local training epochs')
     parser.add_argument('--num_users', type=int, default=5, help='num of clients')
@@ -110,9 +111,9 @@ def args_parser():
     parser.add_argument('--g_steps', default=40, type=int, help='number of generation steps.')
 
     # Client Training
-    parser.add_argument('--num_worker', type=int, default=2, help='number of worker for dataloader')
+    parser.add_argument('--num_worker', type=int, default=4, help='number of worker for dataloader')
     parser.add_argument('--mulc', type=str, default="fork", help='type of multi process for dataloader')
-    parser.add_argument('--weight_decay', default=5e-4, type=float, help='weight decay for optimizer')
+    parser.add_argument('--weight_decay', default=1e-5, type=float, help='weight decay for optimizer')
     parser.add_argument('--syn_bs', default=1, type=int,
                         help='number of old synthetic data in training, 1 for similar to local_bs')
     parser.add_argument('--local_lr', default=4e-2, type=float, help='learning rate for optimizer')
@@ -121,8 +122,8 @@ def args_parser():
     parser.add_argument('--aug_mode', default='color_jitter', type=str,
                         help='augmentation_mode: hflip,vflip,color_jitter,invert')
     parser.add_argument('--n', default=1, type=int, help='number of retained dataset')
-    parser.add_argument('--lambda', default=0.1, type=float, help='number of retained dataset')
-    parser.add_argument('--temp', default=0.5, type=float, help='temperature parameter')
+    parser.add_argument('--lambda', default=0.1, type=float, help='GSA loss weight')
+    parser.add_argument('--temp', default=0.5, type=float, help='GSA temperature')
     parser.add_argument('--tttt', default=255, type=int, help='transparency setting')
     parser.add_argument('--tau_old', default=0.9, type=float, help='temperature parameter')
     parser.add_argument('--tau_new', default=1.1, type=float, help='temperature parameter')
@@ -131,7 +132,8 @@ def args_parser():
     parser.add_argument('--w_old', default=1.1, type=float, help='weighted parameter')
     parser.add_argument('--w_new', default=1.0, type=float, help='weighted parameter')
     parser.add_argument('--syn_size', default=32, type=int, help='weighted parameter')
-    parser.add_argument('--ema_decay', type=float, default=0.8)
+    parser.add_argument('--ema_decay', type=float, default=0.7, help='EGC prior EMA coefficient')
+    parser.add_argument('--eval_each_round', action='store_true', help='evaluate after each communication round')
     parser.add_argument('--conv_dim', type=int, default=64)
     parser.add_argument('--tau', type=int, default=16)
     parser.add_argument('--alpha', type=float, default=0.15)

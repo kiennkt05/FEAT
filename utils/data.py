@@ -2,9 +2,7 @@ import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
 from utils.tiny_imagenet import TinyImageNet
-from utils.DomainNet import build_merged_domainnet
 import os
-import ipdb
 
 
 data_dir = "../datasets/"
@@ -214,6 +212,7 @@ class DomainNet345(iData):   # 200*500=10w, 5 tasks, each task=40*500=2w
 
     def download_data(self):
         root = '../datasets/DomainNet/'
+        from utils.DomainNet import build_merged_domainnet
         domains = ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch']
         train_dst, test_dst = build_merged_domainnet(root=root, domains=domains, split=0.3, seed=123, transform_train=self.train_trsf, transform_test=self.test_trsf)
         # ipdb.set_trace()
