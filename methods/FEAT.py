@@ -177,7 +177,7 @@ class FEAT(BaseLearner):
             train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"]
         )
         self._fl_train(train_dataset)
-        if self._cur_task < data_manager.nb_tasks - 1:
+        if self._cur_task < data_manager.nb_tasks - 1 or getattr(self, "select_on_last_task", False):
             self._retain_exemplars(train_dataset)
 
     def _fl_train(self, train_dataset):

@@ -54,6 +54,38 @@ runs here are exploratory and must not be compared directly with the paper's
 TinyImageNet-Subset results. `--num_class` does not select a subset:
 `main.py` sets it to 200 for `tiny_imagenet`.
 
+## LANDER Exp5a-Global
+
+`--method=exp5a_global` runs either FEAT training implementation with LANDER's
+Exp5a-Global replay selector in place of its existing selector. The selector
+accumulates exact sample contributions to the five trainable BatchNorm affine
+updates in the final ResNet stage (FEAT's ETF classifier is fixed), validates
+the SGD attribution, then uses LANDER's pooled uncentered PCA and client-wise
+residual greedy selection. `--implementation=paper` keeps FEAT_F's loss and
+replay behavior; `--implementation=repo` keeps the original repository's GSA
+loss (`--kd`), learning rate schedule, replay composition (`--n`, `--tttt`),
+and best-model snapshot behavior. The repo implementation stores selected
+examples as its original `IndexedDataset` objects and selects memory only
+before the final task, as in its original trainer.
+The attribution gate checks the executed communication rounds before the repo
+trainer restores its best-model snapshot; replay trajectories include those
+rounds.
+
+```powershell
+python main.py --method=exp5a_global --dataset=cifar100 --tasks=5 --num_users=5 --beta=0.5 --gdr_task_budget=1000 --exp5a_rank=128
+```
+
+For the original repository training path:
+
+```powershell
+python main.py --method=exp5a_global --implementation=repo --dataset=cifar100 --tasks=5 --num_users=5 --beta=0.5 --gdr_task_budget=1000 --exp5a_rank=128 --kd=0.1
+```
+
+For this method, FEAT keeps its `--beta=0.5` default. Projection rank is `128`,
+oversampling is `16`, and attribution tolerance is `0.05`. The total task replay
+budget follows LANDER's dataset/task table unless `--gdr_task_budget` is given.
+The FEAT data loader uses `../datasets/`; CPU and CUDA runs are supported.
+
 ## One FEAT_F run
 
 This is the paper's CIFAR-100, 5-task, 5-client, `beta=0.1` setting with this
