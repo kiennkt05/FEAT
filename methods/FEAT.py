@@ -145,7 +145,7 @@ class FEAT(BaseLearner):
             local_labels.append(train_dataset.labels[client_indices])
 
         selected = select_fedcbdr_indices(
-            local_features, local_labels, per_client_budget=budget,
+            local_features, local_labels, total_budget=budget,
             seed=self.seed + self._cur_task
         )
         for client, positions in selected.items():
@@ -177,7 +177,7 @@ class FEAT(BaseLearner):
             train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"]
         )
         self._fl_train(train_dataset)
-        if self._cur_task < data_manager.nb_tasks - 1 or getattr(self, "select_on_last_task", False):
+        if self._cur_task < data_manager.nb_tasks - 1:
             self._retain_exemplars(train_dataset)
 
     def _fl_train(self, train_dataset):

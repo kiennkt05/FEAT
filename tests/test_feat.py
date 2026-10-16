@@ -65,7 +65,7 @@ class FEATTests(unittest.TestCase):
         args = {
             "implementation": "repo", "method": "feat", "dataset": "cifar10",
             "tasks": 2, "beta": 0, "num_users": 2, "frac": 1.0,
-            "mem_size": 1, "k_value": 0, "p_value": 0, "seed": 2,
+            "mem_size": 2, "k_value": 0, "p_value": 0, "seed": 2,
             "local_ep": 1, "net": "resnet18", "gpu": 0,
             "init_cls": 2, "increment": 2, "class_order": [0, 1, 2, 3],
             "wandb": 0, "save_dir": "", "nums": 0,
@@ -89,6 +89,7 @@ class FEATTests(unittest.TestCase):
         result = learner.eval_task(args, 2, learner.PH, learner.PT,
                                    learner.bar_eH_G, learner.r_H, learner.r_T)
         self.assertIn("top1", result[0])
+        self.assertEqual(set(result[0]), {"grouped", "top1"})
         args["implementation"] = "paper"
         with patch("methods.FEAT.IncrementalNet_CausalETF", side_effect=small_network), \
              patch("main.logging.basicConfig"):
@@ -97,16 +98,29 @@ class FEATTests(unittest.TestCase):
 
     def test_repo_selector_returns_local_indices(self):
         selector = FLDataSelector(
-            2, [torch.eye(3), torch.eye(3)], query_budget=3
+            2, [torch.eye(3), torch.eye(3)], query_budget=4
         )
         masked = selector.mask_local_data()
         probabilities = selector.aggregate_leverage_scores(
             selector.compute_local_leverage_scores(masked)
         )
         selected = selector.sample_data(probabilities)
-        self.assertEqual(sum(len(rows) for rows in selected.values()), 3)
+        self.assertEqual([len(rows) for rows in selected.values()], [2, 2])
         self.assertTrue(all(0 <= index < 3
                             for rows in selected.values() for index in rows))
+        selector.query_budget = 3
+        with self.assertRaisesRegex(ValueError, 'divisible by num_users'):
+            selector.sample_data(probabilities)
+
+    def test_repo_selection_requires_each_client_to_have_task_data(self):
+        learner = object.__new__(RepoFEAT)
+        learner.args = {'mem_size': 4, 'num_users': 2}
+        learner.user_groups = {0: [0, 1], 1: []}
+        learner._extract_client_features = lambda client: self.fail(
+            f'feature extraction should not run for client {client}'
+        )
+        with self.assertRaisesRegex(ValueError, 'client 1 has 0 task candidates'):
+            learner._select_data_for_retention()
 
     def test_fedcbdr_global_leverage_and_balanced_unique_selection(self):
         features = [
@@ -117,12 +131,14 @@ class FEATTests(unittest.TestCase):
         scores = global_leverage_scores(features, seed=4)
         self.assertGreater(float(scores[0][2]), float(scores[0][0]))
         self.assertAlmostEqual(sum(float(item.sum()) for item in scores), 2.0, places=4)
-        selected = select_fedcbdr_indices(features, labels, per_client_budget=2, seed=4)
-        self.assertEqual(sum(map(len, selected.values())), 4)
-        self.assertTrue(all(len(rows) == 2 and len(rows) == len(set(rows))
+        selected = select_fedcbdr_indices(features, labels, total_budget=4, seed=4)
+        self.assertEqual([len(rows) for rows in selected.values()], [2, 2])
+        self.assertTrue(all(len(rows) == len(set(rows))
                             for rows in selected.values()))
         chosen_labels = [labels[client][rows] for client, rows in selected.items()]
         self.assertEqual(np.bincount(np.concatenate(chosen_labels), minlength=2).tolist(), [2, 2])
+        with self.assertRaisesRegex(ValueError, 'divisible by num_users'):
+            select_fedcbdr_indices(features, labels, total_budget=3, seed=4)
 
     def test_weighted_tail_priors(self):
         global_prior = aggregate_ecc_priors_from_clients([
@@ -165,7 +181,7 @@ class FEATTests(unittest.TestCase):
             "wandb": 0, "save_dir": "", "nums": 0, "num_users": 2,
             "num_worker": 0, "mulc": None, "local_bs": 16,
             "local_ep": 1, "local_lr": 0.01, "weight_decay": 1e-5,
-            "mem_size": 1, "beta": 0, "com_round": 1,
+            "mem_size": 2, "beta": 0, "com_round": 1,
             "lambda": 0.1, "temp": 0.5, "ema_decay": 0.7,
         }
         with patch("methods.FEAT.IncrementalNet_CausalETF", side_effect=small_network):
@@ -175,7 +191,8 @@ class FEATTests(unittest.TestCase):
         learner.incremental_train(manager, logger)
         self.assertEqual(learner._total_classes, 2)
         self.assertIsNone(learner.bar_eH_G)
-        self.assertEqual([len(task_sets[0][1]) for task_sets in learner.retained_ds_all], [1, 1])
+        self.assertEqual(sum(len(task_sets[0][1]) if task_sets else 0
+                             for task_sets in learner.retained_ds_all), 2)
         learner.after_task()
         learner.incremental_train(manager, logger)
         self.assertEqual(learner._total_classes, 4)
@@ -184,6 +201,7 @@ class FEATTests(unittest.TestCase):
         result = learner.eval_task(args, 2, learner.PH, learner.PT,
                                    learner.bar_eH_G, learner.r_H, learner.r_T)
         self.assertIn("top1", result[0])
+        self.assertEqual(set(result[0]), {"grouped", "top1"})
 
 
 if __name__ == "__main__":

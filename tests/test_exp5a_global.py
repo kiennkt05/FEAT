@@ -42,7 +42,7 @@ class Exp5aGlobalIntegrationTests(unittest.TestCase):
             'main.py', '--method=exp5a_global', '--implementation=repo',
             '--dataset=cifar10', '--tasks=2', '--num_users=2', '--com_round=2',
             '--local_ep=1', '--local_bs=4', '--num_worker=0',
-            '--mem_size=2', '--exp5a_rank=2', '--beta=0', '--n=2',
+            '--mem_size=4', '--exp5a_rank=2', '--beta=0', '--n=2',
         ]):
             args = vars(args_parser())
         args.update(num_class=4, init_cls=2, increment=2, save_dir='')
@@ -100,6 +100,11 @@ class Exp5aGlobalIntegrationTests(unittest.TestCase):
         self.assertEqual(args.exp5a_rank, 128)
         self.assertEqual(args.mem_size, 50)
         self.assertNotIn('gdr_task_budget', vars(args))
+        with patch('sys.argv', ['main.py', '--method=exp5a_global',
+                                 '--num_users=2', '--mem_size=3']), \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                args_parser()
         with patch('sys.argv', ['main.py', '--method=exp5a_global', '--gdr_task_budget=4']), \
              contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
@@ -179,7 +184,7 @@ class Exp5aGlobalIntegrationTests(unittest.TestCase):
         with patch('sys.argv', [
             'main.py', '--method=exp5a_global', '--dataset=cifar10', '--tasks=2',
             '--num_users=2', '--com_round=1', '--local_ep=1', '--local_bs=4',
-            '--num_worker=0', '--mem_size=2', '--exp5a_rank=2', '--beta=0',
+            '--num_worker=0', '--mem_size=4', '--exp5a_rank=2', '--beta=0',
         ]):
             args = vars(args_parser())
         args.update(num_class=4, init_cls=2, increment=2, save_dir='')
@@ -209,7 +214,8 @@ class Exp5aGlobalIntegrationTests(unittest.TestCase):
                 train(args)
         finally:
             torch.use_deterministic_algorithms(deterministic)
-        self.assertEqual(sum(row['type'] == 'step' for row in records), 8)
+        # The final task is never retained: it has no later training task.
+        self.assertEqual(sum(row['type'] == 'step' for row in records), 4)
         self.assertEqual(replay_counts, [2, 2])
         self.assertIn('[Attribution Invariant Gate] PASSED successfully.', output.getvalue())
         self.assertIn('Exp5 Replay Evaluation', output.getvalue())

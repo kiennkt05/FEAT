@@ -273,7 +273,7 @@ class BaseLearner(object):
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
-        return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+        return np.concatenate(y_pred), np.concatenate(y_true)  # [N]
 
     def _eval_nme(self, loader, class_means):
         self._network.eval()

@@ -6,6 +6,7 @@ except ImportError:
     wandb = None
 from utils.dmc import DataManager, setup_seed
 from utils.toolkit import count_parameters
+from utils.replay_budget import check_fedcbdr_mem_size, equal_client_quota
 
 from methods.FEAT import FEAT
 from methods.FEAT_repo import FEAT as RepoFEAT
@@ -65,7 +66,7 @@ def train(args):
     # ipdb.set_trace()
     learner, logger = get_learner(args["method"], args)
     logger.info(str(args))
-    cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
+    cnn_curve = []
     # ipdb.set_trace()
     # train for each task
     for task in range(data_manager.nb_tasks):
@@ -78,8 +79,8 @@ def train(args):
             learner.after_task()
             logger.info(str(cnn_accy["grouped"]))
             print("CNN: {}".format(cnn_accy["grouped"]))
-            cnn_curve["top1"].append(cnn_accy["top1"])
-            print("CNN top1 curve: {}".format(cnn_curve["top1"]))
+            cnn_curve.append(cnn_accy["top1"])
+            print("CNN top1 curve: {}".format(cnn_curve))
 
 
 def args_parser():
@@ -142,7 +143,9 @@ def args_parser():
     parser.add_argument('--tau_new', default=1.1, type=float, help='temperature parameter')
     parser.add_argument('--scale', default=True, type=bool, help='weighted parameter')
     parser.add_argument('--mem_size', default=50, type=int,
-                        help='replay samples selected per client from each task')
+                        help='replay samples selected per task across all clients')
+    parser.add_argument('--check_fedcbdr_mem_size', action='store_true',
+                        help='require the dataset/task replay budget reported in FedCBDR')
     parser.add_argument('--w_old', default=1.1, type=float, help='weighted parameter')
     parser.add_argument('--w_new', default=None, type=float, help='weighted parameter')
     parser.add_argument('--syn_size', default=32, type=int, help='weighted parameter')
@@ -204,6 +207,12 @@ def args_parser():
         args.wandb = 0 if exp5 else 1
     if args.w_new is None:
         args.w_new = 1.0
+    try:
+        if args.check_fedcbdr_mem_size:
+            check_fedcbdr_mem_size(args.dataset, args.tasks, args.mem_size)
+        equal_client_quota(args.mem_size, args.num_users)
+    except ValueError as exc:
+        parser.error(str(exc))
     if exp5:
         if (args.repeat_rate != 1 or args.sample_weighted_fedavg or args.repo_dual or
                 args.exp5_distill_loss or args.exp5_single_distill_loss or

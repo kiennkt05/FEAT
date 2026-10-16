@@ -18,6 +18,7 @@ from tqdm import tqdm
 from methods.FEAT import FEAT, aggregate_ecc_priors_from_clients, estimate_ecc_priors, gsa_distill_loss
 from methods.exp5a_global import Exp5aGlobal
 from utils.dmc import DummyDataset, average_weights
+from utils.replay_budget import equal_client_quota
 
 
 class FEATExp5aGlobal(FEAT):
@@ -31,7 +32,6 @@ class FEATExp5aGlobal(FEAT):
     def __init__(self, args):
         super().__init__(args)
         self.num_users = args["num_users"]
-        self.select_on_last_task = True
         self.exp5a_rank = args.get("exp5a_rank", 128)
         self.exp5a_svd_oversampling = args.get("exp5a_svd_oversampling", 16)
         self.target_mode = args.get("exp5a_target_mode", "budget_scaled_sum")
@@ -145,6 +145,9 @@ class FEATExp5aGlobal(FEAT):
             raise RuntimeError("Trajectory attribution invariant gate FAILED: "
                                f"E_task={task_error:.4e}, max_E_a={max_error:.4e}, tau={self.tau}")
         print("[Attribution Invariant Gate] PASSED successfully.")
+        if self._cur_task == self.data_manager.nb_tasks - 1:
+            # No replay selection follows the final task; release its rows.
+            self.trajectory_matrix = None
 
     def _local_update_with_trajectory(self, model, loader, lr, client, num_current, client_weight):
         model.train()
@@ -222,12 +225,13 @@ class FEATExp5aGlobal(FEAT):
                 hook.remove()
 
     def _retain_exemplars(self, train_dataset):
-        # FEAT and FedCBDR specify a per-client, per-task replay allowance.
-        budget = self.num_users * self.args["mem_size"]
+        # One replay budget for all clients' candidates in this task.
+        budget = self.args["mem_size"]
         if budget <= 0:
             self.trajectory_matrix = None
             return
         groups, offsets, rows = self.user_groups, self._exp5_offsets, self._exp5_rows
+        equal_client_quota(budget, self.num_users, [len(groups[k]) for k in range(self.num_users)])
         if budget > len(rows):
             raise ValueError(f"Exp5a replay budget {budget} exceeds {len(rows)} task candidates")
         projected, _, _ = self._compute_projected_trajectories(groups, offsets, rows)

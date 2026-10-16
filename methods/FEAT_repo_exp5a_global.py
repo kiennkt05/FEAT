@@ -21,6 +21,7 @@ from methods.FEAT_repo import (FEAT as RepoFEAT, CustomConcatDataset,
                                estimate_ecc_priors, gsa_distill_loss)
 from methods.exp5a_global import Exp5aGlobal
 from utils.dmc import DatasetSplit, average_weights, partition_data
+from utils.replay_budget import equal_client_quota
 
 
 class RepoFEATExp5aGlobal(RepoFEAT):
@@ -253,12 +254,13 @@ class RepoFEATExp5aGlobal(RepoFEAT):
         return model.state_dict(), total_loss
 
     def _select_data_for_retention(self):
-        # Use the papers' independent per-client, per-task replay allowance.
-        budget = self.num_users * self.args["mem_size"]
+        # One replay budget for all clients' candidates in this task.
+        budget = self.args["mem_size"]
         rows, offsets, groups = self._exp5_rows, self._exp5_offsets, self.user_groups
         if budget <= 0:
             self.selected_data_indices = {client: [] for client in range(self.num_users)}
             return
+        equal_client_quota(budget, self.num_users, [len(groups[k]) for k in range(self.num_users)])
         if budget > len(rows):
             raise ValueError(f"Exp5a replay budget {budget} exceeds {len(rows)} task candidates")
         projected, _, _ = self._compute_projected_trajectories(groups, offsets, rows)

@@ -20,10 +20,6 @@ class BaseLearner(object):
         self._network = None
         self._old_network = None
         self._data_memory, self._targets_memory = np.array([]), np.array([])
-        if args['dataset'] == 'cifar10':
-            self.topk = 2
-        else:
-            self.topk = 5
         self.args = args
         self.each_task = args["increment"]
         self.seed = args["seed"]
@@ -127,14 +123,9 @@ class BaseLearner(object):
 
     def _evaluate(self, y_pred, y_true):
         ret = {}
-        grouped = accuracy(y_pred.T[0], y_true, self._known_classes, increment=self.each_task)
+        grouped = accuracy(y_pred, y_true, self._known_classes, increment=self.each_task)
         ret["grouped"] = grouped
         ret["top1"] = grouped["total"]
-        ret["top{}".format(self.topk)] = np.around(
-            (y_pred.T == np.tile(y_true, (y_pred.shape[1], 1))).sum() * 100 / len(y_true),
-            decimals=2,
-        )
-
         return ret
 
     def eval_task(self, args, old_classes, P_H=None, P_T=None, bar_eH_G: float = None, r_H: int = None, r_T: int = None):
@@ -201,15 +192,11 @@ class BaseLearner(object):
             with torch.no_grad():
                 outputs = self._network(inputs, P_H, P_T, bar_eH_G, r_H, r_T)["logits"]
             
-            predicts = torch.topk(
-                outputs, k=min(self.topk, outputs.shape[1]), dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            predicts = torch.argmax(outputs, dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
-        return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+        return np.concatenate(y_pred), np.concatenate(y_true)  # [N]
 
     def _eval_nme(self, loader, class_means):
         self._network.eval()
@@ -221,7 +208,7 @@ class BaseLearner(object):
                  - 2 * class_means @ vectors.T)  # [nb_classes, N]
         scores = dists.T  # [N, nb_classes], choose the one with the smallest distance
 
-        return np.argsort(scores, axis=1)[:, : self.topk], y_true  # [N, topk]
+        return np.argmin(scores, axis=1), y_true  # [N]
 
     def _extract_vectors(self, loader):
         self._network.eval()

@@ -10,6 +10,8 @@ from collections import defaultdict
 import numpy as np
 import torch
 
+from utils.replay_budget import equal_client_quota
+
 
 def global_leverage_scores(local_features, *, seed=0):
     """Return one global-SVD leverage vector per client in original row order."""
@@ -57,32 +59,28 @@ def global_leverage_scores(local_features, *, seed=0):
     return scores
 
 
-def select_fedcbdr_indices(local_features, local_labels, *, per_client_budget, seed=0):
-    """Select globally informed, class-balanced unique IDs under client caps.
+def select_fedcbdr_indices(local_features, local_labels, *, total_budget, seed=0):
+    """Select globally informed, class-balanced unique IDs under one task budget.
 
     Returns a dict of client ID to row positions within that client's current
-    task dataset.  The total target is K * per_client_budget and each
-    client's cap is per_client_budget.  A round-robin over classes
-    balances the global buffer; within a class, exponential-race keys perform
-    leverage-weighted sampling without replacement.
+    task dataset. Each client receives exactly total_budget / K unique
+    samples. A round-robin over classes balances the global buffer; within a
+    class, exponential-race keys perform leverage-weighted sampling.
     """
     if len(local_features) != len(local_labels):
         raise ValueError("Each feature matrix needs its matching labels")
-    if per_client_budget < 0:
-        raise ValueError("per_client_budget must be nonnegative")
     client_count = len(local_features)
     selected = {client: [] for client in range(client_count)}
-    if not client_count or per_client_budget == 0:
-        return selected
-
     labels = [np.asarray(item, dtype=np.int64) for item in local_labels]
     if any(len(features) != len(classes) for features, classes in zip(local_features, labels)):
         raise ValueError("Feature rows and labels must align")
+    quota = equal_client_quota(total_budget, client_count, [len(item) for item in labels])
+    if total_budget == 0:
+        return selected
     class_ids = sorted(set(np.concatenate(labels).tolist())) if any(len(item) for item in labels) else []
     if not class_ids:
         return selected
-    client_cap = per_client_budget
-    total_cap = client_cap * client_count
+    total_cap = total_budget
     leverage = global_leverage_scores(local_features, seed=seed)
     generator = np.random.default_rng(seed)
     queues = defaultdict(list)
@@ -105,7 +103,7 @@ def select_fedcbdr_indices(local_features, local_labels, *, per_client_budget, s
         for class_id in class_ids:
             queue = queues[class_id]
             pointer = offsets[class_id]
-            while pointer < len(queue) and len(selected[queue[pointer][1]]) >= client_cap:
+            while pointer < len(queue) and len(selected[queue[pointer][1]]) >= quota:
                 pointer += 1
             offsets[class_id] = pointer
             if pointer == len(queue):
@@ -118,5 +116,5 @@ def select_fedcbdr_indices(local_features, local_labels, *, per_client_budget, s
             if total_selected >= total_cap:
                 break
         if not made_progress:
-            break
+            raise RuntimeError("could not fill equal replay quotas from task candidates")
     return selected

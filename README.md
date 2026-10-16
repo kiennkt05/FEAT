@@ -28,8 +28,8 @@ schedule, and best-model selection. The original repository did not include
 `utils/inc_net.py`, so both paths use the currently available ETF network.
 The restored path includes small import, device, worker, indexing, and
 classifier-shape repairs required to run it. These two modes are distinct
-implementations. This checkout also passes `num_users * mem_size` to the repo
-selector so `--mem_size` has the papers' per-client, per-task meaning.
+implementations. This checkout passes `mem_size` directly as the repo
+selector's task-wide query budget across all clients.
 The original selector builds a dense square orthogonal mask per client, so
 `repo` mode can require substantially more memory during exemplar selection.
 The upstream trainer snapshots `best_model` before loading the current round's
@@ -83,11 +83,12 @@ python main.py --method=exp5a_global --implementation=repo --dataset=cifar100 --
 ```
 
 For this method, FEAT keeps its `--beta=0.5` default. Projection rank is `128`,
-oversampling is `16`, and attribution tolerance is `0.05`. `--mem_size` controls
-the per-client selection count from each task in both implementations. With
-`K` clients, Exp5a requests `K * mem_size` samples overall. Selection is
-without replacement, so each client needs at least `mem_size` task candidates.
-The examples above each request 1,000 samples per client.
+oversampling is `16`, and attribution tolerance is `0.05`. `--mem_size` is
+the total number of samples selected from one task across all clients. Every
+client receives exactly `mem_size / num_users` replay samples. The budget must
+be divisible by the client count; Exp5a samples without replacement, so each
+client also needs that many task candidates. The examples above request 1,000
+samples total, or 200 from each of five clients.
 The FEAT data loader uses `../datasets/`; CPU and CUDA runs are supported.
 
 ## One FEAT_F run
@@ -129,18 +130,37 @@ rate 0.04, and weight decay `1e-5`. For GSA it searches
 searches `--ema_decay` in `{0.5, 0.7, 0.9}`. The example above uses
 `0.1 / 0.5 / 0.7`; the paper does not identify one universal best combination.
 
-The [FEAT paper](https://arxiv.org/pdf/2604.08617) and the
-[FedCBDR paper](https://arxiv.org/pdf/2507.07712) define a buffer on **each
-client** and report exemplar counts **per task**. Their class balancing affects
-which examples are selected; it does not multiply the budget by the number of
-classes. In this runner, `--mem_size N` selects up to `N` examples from the
-current task on each client, for up to `K * N` examples across `K` clients.
-`paper` mode samples without replacement and balances classes across clients;
-`repo` mode keeps the original selector's sampling with replacement. Neither
-runner currently enforces the papers' separate fixed capacity for the
-**cumulative** buffer across all previous tasks.
+For both the [FEAT paper](https://arxiv.org/pdf/2604.08617) and
+[FedCBDR paper](https://arxiv.org/pdf/2507.07712) paths in this runner,
+`--mem_size N` is the **only replay budget**: exactly `N` exemplar slots are
+selected from each nonfinal task across all clients. Each of `K` clients
+retains exactly `N / K` slots from its own task data; `N` must be divisible by
+`K`. `paper` mode needs at least `N / K` local examples, samples without
+replacement, and balances classes across clients. `repo` mode needs at least
+one local example and preserves its selector's sampling with replacement, so
+a client's slots can contain repeated examples. Prior-task selections
+accumulate for later replay; there is no
+separate cumulative client-buffer limit. No samples are retained from the final
+task because there is no subsequent task to replay them.
 
-| Dataset | Tasks | `--beta` | `--num_users` | Paper examples per task, per client | CLI `--mem_size` |
+To check the exact **FedCBDR main-experiment** budgets quoted in its Section 5.1,
+add `--check_fedcbdr_mem_size`. The check rejects a mismatched `--mem_size` or
+an unlisted dataset/task pair. It is optional because FEAT's TinyImageNet-Subset
+settings and replay-budget ablations use different per-task values.
+
+| Dataset | Tasks | Required `--mem_size` with `--check_fedcbdr_mem_size` |
+| --- | ---: | ---: |
+| CIFAR-10 | 3 | 450 |
+| CIFAR-10 | 5 | 300 |
+| CIFAR-100 | 5 | 1000 |
+| CIFAR-100 | 10 | 500 |
+| TinyImageNet (`tiny_imagenet`) | 10 | 2000 |
+| TinyImageNet (`tiny_imagenet`) | 20 | 1000 |
+
+The FEAT paper's main-experiment settings are listed separately below. Its
+TinyImageNet-Subset values differ from the FedCBDR settings above.
+
+| Dataset | Tasks | `--beta` | `--num_users` | Reported task budget | CLI `--mem_size` |
 | --- | ---: | --- | --- | ---: | ---: |
 | CIFAR-10 | 3 | 0.5, 1.0 | 5, 10 | 450 | 450 |
 | CIFAR-10 | 5 | 0.5, 1.0 | 5, 10 | 300 | 300 |
@@ -208,7 +228,7 @@ foreach ($taskCount in @(5, 10)) {
 ```
 
 The full Tiny ImageNet loader still differs from the paper's subset even when
-the per-client exemplar counts match.
+the task-wide selection counts match.
 
 ## Other paper experiments
 
@@ -251,7 +271,7 @@ The TinyImageNet-Subset curve remains unavailable without the subset loader.
 
 ### Figure 6: replay volume
 
-For CIFAR-10/5 tasks, the paper's per-client, per-task budgets
+For CIFAR-10/5 tasks, the paper's reported task budgets
 `{100, 150, 300}` map directly to `--mem_size`:
 
 ```powershell

@@ -2,8 +2,8 @@
 
 Source: https://github.com/qizhuang-qz/FEAT/blob/459bab31e19a4215bd1cadde22296507d9f3fdb6/methods/FEAT.py
 The training, local replay, and selection policies follow the upstream file.
-The replay query count uses the papers' per-client, per-task interpretation of
-``mem_size``. Import, device, worker, indexing, and prototype-layout repairs
+The replay query count uses ``mem_size`` as a task-wide budget across clients.
+Import, device, worker, indexing, and prototype-layout repairs
 let this path run with the shared local ETF network.
 """
 
@@ -16,6 +16,7 @@ from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset, Weighte
 from utils.inc_net import IncrementalNet_CausalETF as IncrementalNet
 from methods.base_cvpr import BaseLearner
 from utils.dmc import partition_data, DatasetSplit, average_weights, average_bias_vector, setup_seed, pil_loader
+from utils.replay_budget import equal_client_quota
 import copy
 import os, math
 import pickle
@@ -202,7 +203,10 @@ class FLDataSelector:
 
     def sample_data(self, p):
 
-        min_samples_per_client = self.query_budget // self.num_clients
+        min_samples_per_client = equal_client_quota(
+            self.query_budget, self.num_clients,
+            [len(features) for features in self.local_features], replacement=True
+        )
         client_selected_indices = {i: [] for i in range(self.num_clients)}
 
         start_idx = 0
@@ -212,17 +216,6 @@ class FLDataSelector:
             sampled = torch.multinomial(client_p, min_samples_per_client, replacement=True)
             client_selected_indices[i] = sampled.cpu().tolist()
             start_idx = end_idx
-
-        remaining_budget = self.query_budget - sum(len(v) for v in client_selected_indices.values())
-        if remaining_budget > 0:
-            extra_samples = torch.multinomial(p, remaining_budget, replacement=True).tolist()
-            for idx in extra_samples:
-                for i in range(self.num_clients):
-                    start_idx = sum(len(self.local_features[j]) for j in range(i))
-                    end_idx = start_idx + len(self.local_features[i])
-                    if start_idx <= idx < end_idx:
-                        client_selected_indices[i].append(idx - start_idx)
-                        break
 
         return client_selected_indices
 
@@ -312,24 +305,22 @@ class FEAT(BaseLearner):
         if self.args["mem_size"] <= 0:
             self.selected_data_indices = {i: [] for i in range(self.args["num_users"])}
             return
+        equal_client_quota(
+            self.args["mem_size"], self.args["num_users"],
+            [len(self.user_groups[i]) for i in range(self.args["num_users"])],
+            replacement=True
+        )
         all_client_features = []
-        all_client_indices = []
         for client_idx in range(self.args["num_users"]):
-            try:
-                client_features, client_indices = self._extract_client_features(client_idx)
-                if len(client_features) > 0:
-                    all_client_features.append(client_features)
-                    all_client_indices.append(client_indices)
-            except ValueError as e:
-                print(f"Error extracting features for client {client_idx}: {e}")
-                continue
-
-        if len(all_client_features) == 0:
-            print("No features extracted from any client. Skipping data selection.")
-            return
+            client_features, _ = self._extract_client_features(client_idx)
+            all_client_features.append(client_features)
+        equal_client_quota(
+            self.args["mem_size"], self.args["num_users"],
+            [len(features) for features in all_client_features], replacement=True
+        )
 
         selector = FLDataSelector(self.args["num_users"], all_client_features,
-                                  self.args["num_users"] * self.args["mem_size"])
+                                  self.args["mem_size"])
         masked_features = selector.mask_local_data()
 
         leverage_scores = selector.compute_local_leverage_scores(masked_features)
@@ -337,7 +328,6 @@ class FEAT(BaseLearner):
         p = selector.aggregate_leverage_scores(leverage_scores)
 
         selected_indices = selector.sample_data(p)
-
         self.selected_data_indices = selected_indices
 
     def _extract_client_features(self, client_idx):
