@@ -83,7 +83,7 @@ class FEATTests(unittest.TestCase):
         self.assertIsInstance(learner, RepoFEAT)
         manager = TinyDataManager()
         learner.incremental_train(manager, logger)
-        self.assertTrue(any(learner.retained_ds_all))
+        self.assertEqual([len(task_sets[0]) for task_sets in learner.retained_ds_all], [1, 1])
         learner.after_task()
         learner.incremental_train(manager, logger)
         result = learner.eval_task(args, 2, learner.PH, learner.PT,
@@ -117,9 +117,9 @@ class FEATTests(unittest.TestCase):
         scores = global_leverage_scores(features, seed=4)
         self.assertGreater(float(scores[0][2]), float(scores[0][0]))
         self.assertAlmostEqual(sum(float(item.sum()) for item in scores), 2.0, places=4)
-        selected = select_fedcbdr_indices(features, labels, per_class_budget=1, seed=4)
+        selected = select_fedcbdr_indices(features, labels, per_client_budget=2, seed=4)
         self.assertEqual(sum(map(len, selected.values())), 4)
-        self.assertTrue(all(len(rows) <= 2 and len(rows) == len(set(rows))
+        self.assertTrue(all(len(rows) == 2 and len(rows) == len(set(rows))
                             for rows in selected.values()))
         chosen_labels = [labels[client][rows] for client, rows in selected.items()]
         self.assertEqual(np.bincount(np.concatenate(chosen_labels), minlength=2).tolist(), [2, 2])
@@ -175,6 +175,7 @@ class FEATTests(unittest.TestCase):
         learner.incremental_train(manager, logger)
         self.assertEqual(learner._total_classes, 2)
         self.assertIsNone(learner.bar_eH_G)
+        self.assertEqual([len(task_sets[0][1]) for task_sets in learner.retained_ds_all], [1, 1])
         learner.after_task()
         learner.incremental_train(manager, logger)
         self.assertEqual(learner._total_classes, 4)

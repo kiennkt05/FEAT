@@ -36,7 +36,6 @@ class RepoFEATExp5aGlobal(RepoFEAT):
     def __init__(self, args):
         super().__init__(args)
         self.num_users = args["num_users"]
-        self.gdr_task_budget = args["gdr_task_budget"]
         self.exp5a_rank = args.get("exp5a_rank", 128)
         self.exp5a_svd_oversampling = args.get("exp5a_svd_oversampling", 16)
         self.target_mode = args.get("exp5a_target_mode", "budget_scaled_sum")
@@ -254,8 +253,12 @@ class RepoFEATExp5aGlobal(RepoFEAT):
         return model.state_dict(), total_loss
 
     def _select_data_for_retention(self):
-        budget = self.gdr_task_budget
+        # Use the papers' independent per-client, per-task replay allowance.
+        budget = self.num_users * self.args["mem_size"]
         rows, offsets, groups = self._exp5_rows, self._exp5_offsets, self.user_groups
+        if budget <= 0:
+            self.selected_data_indices = {client: [] for client in range(self.num_users)}
+            return
         if budget > len(rows):
             raise ValueError(f"Exp5a replay budget {budget} exceeds {len(rows)} task candidates")
         projected, _, _ = self._compute_projected_trajectories(groups, offsets, rows)

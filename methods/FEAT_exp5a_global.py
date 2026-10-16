@@ -32,7 +32,6 @@ class FEATExp5aGlobal(FEAT):
         super().__init__(args)
         self.num_users = args["num_users"]
         self.select_on_last_task = True
-        self.gdr_task_budget = args["gdr_task_budget"]
         self.exp5a_rank = args.get("exp5a_rank", 128)
         self.exp5a_svd_oversampling = args.get("exp5a_svd_oversampling", 16)
         self.target_mode = args.get("exp5a_target_mode", "budget_scaled_sum")
@@ -223,8 +222,10 @@ class FEATExp5aGlobal(FEAT):
                 hook.remove()
 
     def _retain_exemplars(self, train_dataset):
-        budget = self.gdr_task_budget
+        # FEAT and FedCBDR specify a per-client, per-task replay allowance.
+        budget = self.num_users * self.args["mem_size"]
         if budget <= 0:
+            self.trajectory_matrix = None
             return
         groups, offsets, rows = self.user_groups, self._exp5_offsets, self._exp5_rows
         if budget > len(rows):

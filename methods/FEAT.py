@@ -145,7 +145,7 @@ class FEAT(BaseLearner):
             local_labels.append(train_dataset.labels[client_indices])
 
         selected = select_fedcbdr_indices(
-            local_features, local_labels, per_class_budget=budget,
+            local_features, local_labels, per_client_budget=budget,
             seed=self.seed + self._cur_task
         )
         for client, positions in selected.items():

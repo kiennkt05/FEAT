@@ -1,8 +1,9 @@
 """Compatibility port of the authors' original FEAT trainer.
 
 Source: https://github.com/qizhuang-qz/FEAT/blob/459bab31e19a4215bd1cadde22296507d9f3fdb6/methods/FEAT.py
-The training, local replay, and selection policies remain those from the
-upstream file. Import, device, worker, indexing, and prototype-layout repairs
+The training, local replay, and selection policies follow the upstream file.
+The replay query count uses the papers' per-client, per-task interpretation of
+``mem_size``. Import, device, worker, indexing, and prototype-layout repairs
 let this path run with the shared local ETF network.
 """
 
@@ -328,7 +329,7 @@ class FEAT(BaseLearner):
             return
 
         selector = FLDataSelector(self.args["num_users"], all_client_features,
-                                  (self._total_classes - self._known_classes) * self.args["mem_size"])
+                                  self.args["num_users"] * self.args["mem_size"])
         masked_features = selector.mask_local_data()
 
         leverage_scores = selector.compute_local_leverage_scores(masked_features)

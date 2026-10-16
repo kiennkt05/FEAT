@@ -141,7 +141,8 @@ def args_parser():
     parser.add_argument('--tau_old', default=0.9, type=float, help='temperature parameter')
     parser.add_argument('--tau_new', default=1.1, type=float, help='temperature parameter')
     parser.add_argument('--scale', default=True, type=bool, help='weighted parameter')
-    parser.add_argument('--mem_size', default=50, type=int, help='memory size')
+    parser.add_argument('--mem_size', default=50, type=int,
+                        help='replay samples selected per client from each task')
     parser.add_argument('--w_old', default=1.1, type=float, help='weighted parameter')
     parser.add_argument('--w_new', default=None, type=float, help='weighted parameter')
     parser.add_argument('--syn_size', default=32, type=int, help='weighted parameter')
@@ -155,7 +156,6 @@ def args_parser():
     parser.add_argument('--k_value', type=int, default=0)
     parser.add_argument('--p_value', type=int, default=0)
     # LANDER Exp5a-Global replay selector controls for the FEAT learner.
-    parser.add_argument('--gdr_task_budget', type=int, default=None, help='Exp5 replay budget per task')
     parser.add_argument('--exp5a_rank', type=int, default=128, help='global trajectory projection rank')
     parser.add_argument('--exp5a_svd_oversampling', type=int, default=16)
     parser.add_argument('--exp5a_target_mode', choices=('budget_scaled_sum', 'full_sum'),
@@ -210,18 +210,6 @@ def args_parser():
                 args.fast_cuda or args.t4_parralel or args.eval_interval != 1 or
                 args.fedcbdr_lr_scheduler != 'constant'):
             parser.error('LANDER training and loss switches are unavailable with FEAT training')
-        if args.gdr_task_budget is None:
-            budgets = {
-                'cifar10': {3: 450, 5: 300},
-                'cifar100': {5: 1000, 10: 500, 20: 250},
-                'tiny_imagenet': {10: 2000, 20: 1000},
-            }
-            try:
-                args.gdr_task_budget = budgets[args.dataset][args.tasks]
-            except KeyError:
-                parser.error('Specify --gdr_task_budget for this dataset/task count')
-        if args.gdr_task_budget < 1:
-            parser.error('--gdr_task_budget must be positive')
         if args.exp5a_rank < 1 or args.exp5a_svd_oversampling < 0 or args.exp5a_tau < 0:
             parser.error('invalid Exp5 projection rank, oversampling, or tolerance')
     if args.logits_mode != 'none':

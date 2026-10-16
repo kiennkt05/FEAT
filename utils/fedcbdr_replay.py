@@ -57,22 +57,22 @@ def global_leverage_scores(local_features, *, seed=0):
     return scores
 
 
-def select_fedcbdr_indices(local_features, local_labels, *, per_class_budget, seed=0):
+def select_fedcbdr_indices(local_features, local_labels, *, per_client_budget, seed=0):
     """Select globally informed, class-balanced unique IDs under client caps.
 
     Returns a dict of client ID to row positions within that client's current
-    task dataset.  The total target is K * C_task * per_class_budget and each
-    client's cap is C_task * per_class_budget.  A round-robin over classes
+    task dataset.  The total target is K * per_client_budget and each
+    client's cap is per_client_budget.  A round-robin over classes
     balances the global buffer; within a class, exponential-race keys perform
     leverage-weighted sampling without replacement.
     """
     if len(local_features) != len(local_labels):
         raise ValueError("Each feature matrix needs its matching labels")
-    if per_class_budget < 0:
-        raise ValueError("per_class_budget must be nonnegative")
+    if per_client_budget < 0:
+        raise ValueError("per_client_budget must be nonnegative")
     client_count = len(local_features)
     selected = {client: [] for client in range(client_count)}
-    if not client_count or per_class_budget == 0:
+    if not client_count or per_client_budget == 0:
         return selected
 
     labels = [np.asarray(item, dtype=np.int64) for item in local_labels]
@@ -81,7 +81,7 @@ def select_fedcbdr_indices(local_features, local_labels, *, per_class_budget, se
     class_ids = sorted(set(np.concatenate(labels).tolist())) if any(len(item) for item in labels) else []
     if not class_ids:
         return selected
-    client_cap = len(class_ids) * per_class_budget
+    client_cap = per_client_budget
     total_cap = client_cap * client_count
     leverage = global_leverage_scores(local_features, seed=seed)
     generator = np.random.default_rng(seed)

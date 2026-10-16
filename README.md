@@ -28,7 +28,8 @@ schedule, and best-model selection. The original repository did not include
 `utils/inc_net.py`, so both paths use the currently available ETF network.
 The restored path includes small import, device, worker, indexing, and
 classifier-shape repairs required to run it. These two modes are distinct
-implementations; their `--mem_size` budgets differ.
+implementations. This checkout also passes `num_users * mem_size` to the repo
+selector so `--mem_size` has the papers' per-client, per-task meaning.
 The original selector builds a dense square orthogonal mask per client, so
 `repo` mode can require substantially more memory during exemplar selection.
 The upstream trainer snapshots `best_model` before loading the current round's
@@ -72,18 +73,21 @@ trainer restores its best-model snapshot; replay trajectories include those
 rounds.
 
 ```powershell
-python main.py --method=exp5a_global --dataset=cifar100 --tasks=5 --num_users=5 --beta=0.5 --gdr_task_budget=1000 --exp5a_rank=128
+python main.py --method=exp5a_global --dataset=cifar100 --tasks=5 --num_users=5 --beta=0.5 --mem_size=1000 --exp5a_rank=128
 ```
 
 For the original repository training path:
 
 ```powershell
-python main.py --method=exp5a_global --implementation=repo --dataset=cifar100 --tasks=5 --num_users=5 --beta=0.5 --gdr_task_budget=1000 --exp5a_rank=128 --kd=0.1
+python main.py --method=exp5a_global --implementation=repo --dataset=cifar100 --tasks=5 --num_users=5 --beta=0.5 --mem_size=1000 --exp5a_rank=128 --kd=0.1
 ```
 
 For this method, FEAT keeps its `--beta=0.5` default. Projection rank is `128`,
-oversampling is `16`, and attribution tolerance is `0.05`. The total task replay
-budget follows LANDER's dataset/task table unless `--gdr_task_budget` is given.
+oversampling is `16`, and attribution tolerance is `0.05`. `--mem_size` controls
+the per-client selection count from each task in both implementations. With
+`K` clients, Exp5a requests `K * mem_size` samples overall. Selection is
+without replacement, so each client needs at least `mem_size` task candidates.
+The examples above each request 1,000 samples per client.
 The FEAT data loader uses `../datasets/`; CPU and CUDA runs are supported.
 
 ## One FEAT_F run
@@ -92,7 +96,7 @@ This is the paper's CIFAR-100, 5-task, 5-client, `beta=0.1` setting with this
 repository's default FEAT hyperparameters:
 
 ```powershell
-python main.py --method feat --implementation paper --dataset cifar100 --tasks 5 --num_users 5 --beta 0.1 --com_round 100 --local_ep 2 --local_bs 128 --local_lr 0.04 --weight_decay 1e-5 --mem_size 50 --lambda 0.1 --temp 0.5 --ema_decay 0.7 --seed 2023
+python main.py --method feat --implementation paper --dataset cifar100 --tasks 5 --num_users 5 --beta 0.1 --com_round 100 --local_ep 2 --local_bs 128 --local_lr 0.04 --weight_decay 1e-5 --mem_size 1000 --lambda 0.1 --temp 0.5 --ema_decay 0.7 --seed 2023
 ```
 
 To run the original repository path with the same dataset and training
@@ -100,7 +104,7 @@ schedule, change to `--implementation repo`. In that path, `--kd` controls
 GSA weight, while `--lambda` and `--temp` are unused:
 
 ```powershell
-python main.py --method feat --implementation repo --dataset cifar100 --tasks 5 --num_users 5 --beta 0.1 --com_round 100 --local_ep 2 --local_bs 128 --local_lr 0.04 --weight_decay 1e-5 --mem_size 50 --kd 0.1 --ema_decay 0.7 --seed 2023
+python main.py --method feat --implementation repo --dataset cifar100 --tasks 5 --num_users 5 --beta 0.1 --com_round 100 --local_ep 2 --local_bs 128 --local_lr 0.04 --weight_decay 1e-5 --mem_size 1000 --kd 0.1 --ema_decay 0.7 --seed 2023
 ```
 
 This example deliberately holds training settings constant for comparison.
@@ -125,28 +129,28 @@ rate 0.04, and weight decay `1e-5`. For GSA it searches
 searches `--ema_decay` in `{0.5, 0.7, 0.9}`. The example above uses
 `0.1 / 0.5 / 0.7`; the paper does not identify one universal best combination.
 
-`--mem_size` is an **integer per-class, per-client** budget in `paper` mode. For a
-task with `C` new classes and `K` clients, the replay selector caps each client
-at `C * mem_size` new exemplars and targets up to `K * C * mem_size` in total.
-The cap may not be filled when client data are scarce. The paper reports a
-per-task exemplar budget; the table maps it to this CLI's per-client cap, so
-it should not be read as proof that the paper used identical memory accounting.
-In `repo` mode, the original selector requests `C * mem_size` examples
-**total across all clients** and samples with replacement.
+The [FEAT paper](https://arxiv.org/pdf/2604.08617) and the
+[FedCBDR paper](https://arxiv.org/pdf/2507.07712) define a buffer on **each
+client** and report exemplar counts **per task**. Their class balancing affects
+which examples are selected; it does not multiply the budget by the number of
+classes. In this runner, `--mem_size N` selects up to `N` examples from the
+current task on each client, for up to `K * N` examples across `K` clients.
+`paper` mode samples without replacement and balances classes across clients;
+`repo` mode keeps the original selector's sampling with replacement. Neither
+runner currently enforces the papers' separate fixed capacity for the
+**cumulative** buffer across all previous tasks.
 
-| Dataset | Tasks | `--beta` | `--num_users` | Paper budget per task | CLI `--mem_size` and resulting per-client cap |
-| --- | ---: | --- | --- | ---: | --- |
-| CIFAR-10 | 3 | 0.5, 1.0 | 5, 10 | 450 | 150 gives 450, 450, **600** for the 3/3/4-class tasks |
-| CIFAR-10 | 5 | 0.5, 1.0 | 5, 10 | 300 | 150 gives 300 for each 2-class task |
-| CIFAR-100 | 5 | 0.1, 0.5 | 5, 10 | 1000 | 50 gives 1000 for each 20-class task |
-| CIFAR-100 | 10 | 0.1, 0.5 | 5, 10 | 500 | 50 gives 500 for each 10-class task |
-| TinyImageNet-Subset | 5 | 0.1, 0.5 | 5, 10 | 500 | Not reproducible with the current full-200-class loader |
-| TinyImageNet-Subset | 10 | 0.1, 0.5 | 5, 10 | 250 | Not reproducible with the current full-200-class loader |
+| Dataset | Tasks | `--beta` | `--num_users` | Paper examples per task, per client | CLI `--mem_size` |
+| --- | ---: | --- | --- | ---: | ---: |
+| CIFAR-10 | 3 | 0.5, 1.0 | 5, 10 | 450 | 450 |
+| CIFAR-10 | 5 | 0.5, 1.0 | 5, 10 | 300 | 300 |
+| CIFAR-100 | 5 | 0.1, 0.5 | 5, 10 | 1000 | 1000 |
+| CIFAR-100 | 10 | 0.1, 0.5 | 5, 10 | 500 | 500 |
+| TinyImageNet-Subset | 5 | 0.1, 0.5 | 5, 10 | 500 | 500 with the subset loader |
+| TinyImageNet-Subset | 10 | 0.1, 0.5 | 5, 10 | 250 | 250 with the subset loader |
 
-The 3-task CIFAR-10 split is 3/3/4 classes in this code; no single integer
-`--mem_size` produces 450 for all three tasks. An exact 450-per-task cap would
-require a per-task memory-budget option. The TinyImageNet-Subset rows require
-its class list and matching loader before an exact `--mem_size` can be chosen.
+The TinyImageNet-Subset rows require its class list and matching loader;
+the current loader uses all 200 classes.
 
 ## Table 1: main comparison
 
@@ -165,8 +169,8 @@ $common = @(
     "--lambda", "0.1", "--temp", "0.5", "--ema_decay", "0.7"
 )
 $settings = @(
-    @{ Dataset = "cifar10";  Tasks = @(3, 5);  Betas = @(0.5, 1.0); MemSize = 150 },
-    @{ Dataset = "cifar100"; Tasks = @(5, 10); Betas = @(0.1, 0.5); MemSize = 50 }
+    @{ Dataset = "cifar10";  Tasks = @(3, 5);  Betas = @(0.5, 1.0); MemSize = @{ 3 = 450; 5 = 300 } },
+    @{ Dataset = "cifar100"; Tasks = @(5, 10); Betas = @(0.1, 0.5); MemSize = @{ 5 = 1000; 10 = 500 } }
 )
 $seeds = @(2023, 2024, 2025) # Example seeds; the paper does not name its seeds.
 
@@ -176,7 +180,7 @@ foreach ($setting in $settings) {
             foreach ($clients in @(5, 10)) {
                 foreach ($seed in $seeds) {
                     python main.py @common --dataset $setting.Dataset --tasks $taskCount `
-                        --beta $beta --num_users $clients --mem_size $setting.MemSize `
+                        --beta $beta --num_users $clients --mem_size ($setting.MemSize[$taskCount]) `
                         --seed $seed
                     if ($LASTEXITCODE -ne 0) { throw "FEAT run failed" }
                 }
@@ -195,7 +199,7 @@ foreach ($taskCount in @(5, 10)) {
         foreach ($clients in @(5, 10)) {
             foreach ($seed in $seeds) {
                 python main.py @common --dataset tiny_imagenet --tasks $taskCount `
-                    --beta $beta --num_users $clients --mem_size 12 --seed $seed
+                    --beta $beta --num_users $clients --mem_size $(if ($taskCount -eq 5) { 500 } else { 250 }) --seed $seed
                 if ($LASTEXITCODE -ne 0) { throw "FEAT run failed" }
             }
         }
@@ -203,9 +207,8 @@ foreach ($taskCount in @(5, 10)) {
 }
 ```
 
-With 200 classes and 5 tasks, `--mem_size 12` caps each client at 480
-exemplars per task; with 10 tasks it caps each client at 240. These are close
-to the paper's 500/250 counts, but the dataset and budgets differ.
+The full Tiny ImageNet loader still differs from the paper's subset even when
+the per-client exemplar counts match.
 
 ## Other paper experiments
 
@@ -221,7 +224,7 @@ commands. Passing `--lambda 0` removes GSA's contribution and gives the
 `+ETF+EGC` configuration:
 
 ```powershell
-python main.py @common --dataset cifar10 --tasks 3 --num_users 5 --beta 0.5 --mem_size 150 --lambda 0 --seed 2023
+python main.py @common --dataset cifar10 --tasks 3 --num_users 5 --beta 0.5 --mem_size 450 --lambda 0 --seed 2023
 ```
 
 There is currently no CLI switch to disable EGC or replace the ETF classifier.
@@ -237,7 +240,7 @@ Run the relevant Table 1 settings and use the printed `CNN top1 curve` and
 TinyImageNet-Subset/5 tasks. For example:
 
 ```powershell
-python main.py @common --dataset cifar100 --tasks 10 --num_users 5 --beta 0.5 --mem_size 50 --seed 2023 --eval_each_round
+python main.py @common --dataset cifar100 --tasks 10 --num_users 5 --beta 0.5 --mem_size 500 --seed 2023 --eval_each_round
 ```
 
 Table 4 evaluates the final model by task on CIFAR-10/3 tasks and
@@ -248,25 +251,22 @@ The TinyImageNet-Subset curve remains unavailable without the subset loader.
 
 ### Figure 6: replay volume
 
-For CIFAR-10/5 tasks, the paper's per-task budgets `{100, 150, 300}` map
-exactly to this code's `--mem_size` values `{50, 75, 150}`. For example:
+For CIFAR-10/5 tasks, the paper's per-client, per-task budgets
+`{100, 150, 300}` map directly to `--mem_size`:
 
 ```powershell
-foreach ($memory in @(50, 75, 150)) {
+foreach ($memory in @(100, 150, 300)) {
     python main.py @common --dataset cifar10 --tasks 5 --num_users 5 --beta 0.5 --mem_size $memory --seed 2023
     if ($LASTEXITCODE -ne 0) { throw "FEAT run failed" }
 }
 ```
 
-For CIFAR-100/5 tasks, the paper's `{125, 250, 500}` budgets would require
-`--mem_size` values `{6.25, 12.5, 25}`. Only 500 is exact with the current
-integer option; `{6, 12, 25}` yields `{120, 240, 500}` per client. The
-TinyImageNet-Subset `{250, 500}` sweep needs the subset loader and an exact
-per-task budget option if its class count does not divide these budgets.
-To run the available CIFAR-100 approximations:
+For CIFAR-100/5 tasks, the paper's `{125, 250, 500}` budgets also map
+directly to `--mem_size`. The TinyImageNet-Subset `{250, 500}` sweep still
+needs the subset loader:
 
 ```powershell
-foreach ($memory in @(6, 12, 25)) {
+foreach ($memory in @(125, 250, 500)) {
     python main.py @common --dataset cifar100 --tasks 5 --num_users 5 --beta 0.5 --mem_size $memory --seed 2023
     if ($LASTEXITCODE -ne 0) { throw "FEAT run failed" }
 }
@@ -277,7 +277,7 @@ foreach ($memory in @(6, 12, 25)) {
 Use CIFAR-10/5 tasks, `beta=0.5`, 5 clients. Vary one parameter at a time:
 
 ```powershell
-$case = @("--dataset", "cifar10", "--tasks", "5", "--num_users", "5", "--beta", "0.5", "--mem_size", "150", "--seed", "2023")
+$case = @("--dataset", "cifar10", "--tasks", "5", "--num_users", "5", "--beta", "0.5", "--mem_size", "300", "--seed", "2023")
 foreach ($weight in @(0.05, 0.1, 0.5)) {
     python main.py @case --method feat --implementation paper --lambda $weight --temp 0.5 --ema_decay 0.7
 }
@@ -304,7 +304,7 @@ of interest. For example, on CIFAR-100/5 tasks:
 
 ```powershell
 foreach ($epochs in @(1, 2, 5, 10)) {
-    python main.py @common --dataset cifar100 --tasks 5 --num_users 5 --beta 0.1 --mem_size 50 --local_ep $epochs --seed 2023
+    python main.py @common --dataset cifar100 --tasks 5 --num_users 5 --beta 0.1 --mem_size 1000 --local_ep $epochs --seed 2023
     if ($LASTEXITCODE -ne 0) { throw "FEAT run failed" }
 }
 ```
